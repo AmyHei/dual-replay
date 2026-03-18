@@ -1,0 +1,49 @@
+# Shared defaults
+seed: 42
+num_orderings: 5
+seeds: [42, 123, 456, 789, 1024]
+
+# Debug config (Mac local)
+debug:
+  model_name: "prajjwal1/bert-tiny"
+  num_domains: 3
+  epochs_per_domain: 1
+  batch_size: 8
+  adapter_r: 16
+  max_seq_len: 64
+  domain_buffer_size: 50
+  general_buffer_size: 200
+  learning_rate: 5.0e-4
+  replay_ratio: 0.20
+  domain_replay_fraction: 0.10
+  num_orderings: 1
+
+# Full CLINC150 config (GPU)
+clinc150:
+  model_name: "bert-large-uncased"
+  num_domains: 15
+  epochs_per_domain: 5
+  batch_size: 32
+  adapter_r: 64
+  max_seq_len: 128
+  domain_buffer_size: 200
+  general_buffer_size: 1000
+  learning_rate: 2.0e-4
+  replay_ratio: 0.20
+  domain_replay_fraction: 0.10
+  num_orderings: 5
+
+# T5 config (Phase 3)
+t5:
+  model_name: "t5-base"
+  num_domains: 15
+  epochs_per_domain: 5
+  batch_size: 16
+  adapter_r: 64
+  max_seq_len: 128
+  domain_buffer_size: 200
+  general_buffer_size: 1000
+  learning_rate: 1.0e-4
+  replay_ratio: 0.20
+  domain_replay_fraction: 0.10
+  num_orderings: 5
