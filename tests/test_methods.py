@@ -110,3 +110,34 @@ def test_dual_replay_base_frozen():
     for name, p in method.model.named_parameters():
         if not p.requires_grad and name in base_params_before:
             torch.testing.assert_close(p, base_params_before[name])
+
+
+@pytest.mark.parametrize("method_cls,method_path", [
+    ("LoRAOnly", "src.methods.lora_only"),
+    ("ReplayOnly", "src.methods.replay_only"),
+    ("LoRAReplay", "src.methods.lora_replay"),
+    ("EWC", "src.methods.ewc"),
+    ("OLoRA", "src.methods.o_lora"),
+    ("DER", "src.methods.der"),
+])
+def test_baseline_trains_and_scores(method_cls, method_path):
+    import importlib
+    mod = importlib.import_module(method_path)
+    cls = getattr(mod, method_cls)
+
+    method = cls(
+        model_name="prajjwal1/bert-tiny",
+        num_domains=2,
+        learning_rate=5e-4,
+        epochs=1,
+        batch_size=4,
+        max_seq_len=32,
+    )
+    method.setup()
+
+    train_data = [{"text": f"example {i}", "label": i % 2} for i in range(20)]
+    test_data = [{"text": f"test {i}", "label": i % 2} for i in range(6)]
+
+    method.train_domain(domain_id=0, train_data=train_data)
+    result = method.run_evaluation(test_data)
+    assert "f1" in result
