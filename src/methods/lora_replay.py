@@ -6,7 +6,7 @@ from peft import get_peft_model, LoraConfig, TaskType
 from sklearn.metrics import f1_score
 
 from src.methods.base import BaseContinualMethod
-from src.methods.sequential_ft import TextDataset, _load_model_for_classification, _load_tokenizer
+from src.methods.utils import TextDataset, _load_model_for_classification, _load_tokenizer
 from src.replay.buffer import DomainReplayBuffer
 
 

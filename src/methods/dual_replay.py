@@ -19,10 +19,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-from transformers import BertTokenizer
+from torch.utils.data import DataLoader
+from sklearn.metrics import f1_score, accuracy_score
 
 from src.methods.base import BaseContinualMethod
+from src.methods.utils import _load_tokenizer
 from src.models.adapters import (
     BottleneckAdapter,
     _load_model,
@@ -34,11 +35,12 @@ from src.models.domain_classifier import DomainClassifier
 from src.replay.buffer import DualReplayBuffer
 
 
+
 # ---------------------------------------------------------------------------
-# Dataset
+# Dataset (dual-replay specific: returns 'label' and 'domain' keys)
 # ---------------------------------------------------------------------------
 
-class TextDataset(Dataset):
+class _DualReplayDataset(torch.utils.data.Dataset):
     """Tokenize a list of dicts with 'text', 'label', optional 'domain' keys."""
 
     def __init__(self, examples: list[dict], tokenizer, max_seq_len: int = 128):
@@ -218,11 +220,7 @@ class DualReplay(BaseContinualMethod):
 
     def setup(self):
         """Initialize tokenizer, replay buffer, and model."""
-        try:
-            self.tokenizer = BertTokenizer.from_pretrained(self.model_name)
-        except Exception:
-            from transformers import AutoTokenizer
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+        self.tokenizer = _load_tokenizer(self.model_name)
 
         self.replay_buffer = DualReplayBuffer(
             max_per_domain=self.domain_buffer_size,
@@ -315,7 +313,7 @@ class DualReplay(BaseContinualMethod):
             n_total = len(train_data)
             mixed_data = self._compose_batch(train_data, domain_id, n_total, rng)
 
-            dataset = TextDataset(mixed_data, self.tokenizer, self.max_seq_len)
+            dataset = _DualReplayDataset(mixed_data, self.tokenizer, self.max_seq_len)
             loader = DataLoader(
                 dataset,
                 batch_size=self.batch_size,
@@ -373,7 +371,7 @@ class DualReplay(BaseContinualMethod):
             raise RuntimeError("Must call train_domain() before evaluation.")
         self.model.eval()
 
-        dataset = TextDataset(test_data, self.tokenizer, self.max_seq_len)
+        dataset = _DualReplayDataset(test_data, self.tokenizer, self.max_seq_len)
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
 
         all_preds: list[int] = []
@@ -400,7 +398,6 @@ class DualReplay(BaseContinualMethod):
         if not all_labels:
             return {"f1": 0.0, "accuracy": 0.0}
 
-        from sklearn.metrics import f1_score, accuracy_score
         f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0) * 100.0
         acc = accuracy_score(all_labels, all_preds) * 100.0
         return {"f1": f1, "accuracy": acc}

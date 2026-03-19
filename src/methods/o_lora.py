@@ -10,7 +10,7 @@ from peft import get_peft_model, LoraConfig, TaskType
 from sklearn.metrics import f1_score
 
 from src.methods.base import BaseContinualMethod
-from src.methods.sequential_ft import TextDataset, _load_model_for_classification, _load_tokenizer
+from src.methods.utils import TextDataset, _load_model_for_classification, _load_tokenizer
 
 
 class OLoRA(BaseContinualMethod):
@@ -72,12 +72,12 @@ class OLoRA(BaseContinualMethod):
 
         for _ in range(self.epochs):
             for batch in loader:
-                ids = batch["input_ids"].to(self.device)
-                mask = batch["attention_mask"].to(self.device)
-                lbl = batch["labels"].to(self.device)
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch["labels"].to(self.device)
 
                 optimizer.zero_grad()
-                out = self.model(input_ids=ids, attention_mask=mask, labels=lbl)
+                out = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 out.loss.backward()
                 optimizer.step()
 
@@ -85,12 +85,13 @@ class OLoRA(BaseContinualMethod):
                 steps += 1
 
         # Merge adapter into base and attach a fresh adapter for next domain
+        import logging
         try:
             merged = self.model.merge_and_unload()
             self.model = get_peft_model(merged, self._make_lora_config())
             self.model.to(self.device)
-        except Exception:
-            pass
+        except (ValueError, RuntimeError) as exc:
+            logging.warning("OLoRA merge_and_unload failed, keeping unmerged model: %s", exc)
 
         return {"loss": total_loss / max(steps, 1)}
 
@@ -107,14 +108,14 @@ class OLoRA(BaseContinualMethod):
 
         with torch.no_grad():
             for batch in loader:
-                ids = batch["input_ids"].to(self.device)
-                mask = batch["attention_mask"].to(self.device)
-                lbl = batch["labels"]
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch["labels"]
 
-                out = self.model(input_ids=ids, attention_mask=mask)
+                out = self.model(input_ids=input_ids, attention_mask=attention_mask)
                 preds = out.logits.argmax(dim=-1).cpu().tolist()
                 all_preds.extend(preds)
-                all_labels.extend(lbl.tolist())
+                all_labels.extend(labels.tolist())
 
         f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0) * 100.0
         return {"f1": f1}

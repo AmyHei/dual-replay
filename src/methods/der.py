@@ -12,7 +12,7 @@ from peft import get_peft_model, LoraConfig, TaskType
 from sklearn.metrics import f1_score
 
 from src.methods.base import BaseContinualMethod
-from src.methods.sequential_ft import TextDataset, _load_model_for_classification, _load_tokenizer
+from src.methods.utils import TextDataset, _load_model_for_classification, _load_tokenizer
 from src.replay.buffer import DomainReplayBuffer
 
 
@@ -102,9 +102,9 @@ class DER(BaseContinualMethod):
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
         with torch.no_grad():
             for batch in loader:
-                ids = batch["input_ids"].to(self.device)
-                mask = batch["attention_mask"].to(self.device)
-                out = self.model(input_ids=ids, attention_mask=mask)
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                out = self.model(input_ids=input_ids, attention_mask=attention_mask)
                 all_logits.extend(out.logits.cpu().unbind(0))
         return all_logits
 
@@ -137,13 +137,13 @@ class DER(BaseContinualMethod):
 
         for _ in range(self.epochs):
             for batch in loader:
-                ids = batch["input_ids"].to(self.device)
-                mask = batch["attention_mask"].to(self.device)
-                lbl = batch["labels"].to(self.device)
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch["labels"].to(self.device)
                 s_log = batch["stored_logits"].to(self.device)
 
                 optimizer.zero_grad()
-                out = self.model(input_ids=ids, attention_mask=mask, labels=lbl)
+                out = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 ce = out.loss
 
                 has_stored = s_log.abs().sum(dim=-1) > 0
@@ -182,14 +182,14 @@ class DER(BaseContinualMethod):
 
         with torch.no_grad():
             for batch in loader:
-                ids = batch["input_ids"].to(self.device)
-                mask = batch["attention_mask"].to(self.device)
-                lbl = batch["labels"]
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                labels = batch["labels"]
 
-                out = self.model(input_ids=ids, attention_mask=mask)
+                out = self.model(input_ids=input_ids, attention_mask=attention_mask)
                 preds = out.logits.argmax(dim=-1).cpu().tolist()
                 all_preds.extend(preds)
-                all_labels.extend(lbl.tolist())
+                all_labels.extend(labels.tolist())
 
         f1 = f1_score(all_labels, all_preds, average="macro", zero_division=0) * 100.0
         return {"f1": f1}
