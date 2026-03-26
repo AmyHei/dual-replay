@@ -13,6 +13,7 @@ Training batch composition:
 """
 from __future__ import annotations
 
+import math
 import random
 from typing import Any
 
@@ -23,7 +24,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score, accuracy_score
 
 from src.methods.base import BaseContinualMethod
-from src.methods.utils import _load_tokenizer
+from src.methods.utils import _load_tokenizer, build_optimizer_and_scheduler
 from src.models.adapters import (
     BottleneckAdapter,
     _load_model,
@@ -87,12 +88,21 @@ class DualReplayModel(nn.Module):
         num_labels: int,
         adapter_r: int = 64,
         embed_dim: int = 64,
+        unfreeze_top_k: int = 0,
     ):
         super().__init__()
         # Load and freeze base encoder
         self.encoder = _load_model(model_name)
         for p in self.encoder.parameters():
             p.requires_grad = False
+
+        # Unfreeze top-k encoder layers for more capacity (especially useful
+        # for small models like bert-tiny where adapters alone are insufficient)
+        if unfreeze_top_k > 0:
+            layers_list = get_transformer_layers(self.encoder)
+            for layer in layers_list[-unfreeze_top_k:]:
+                for p in layer.parameters():
+                    p.requires_grad = True
 
         d_model = self.encoder.config.hidden_size
 
@@ -121,23 +131,22 @@ class DualReplayModel(nn.Module):
         self.num_labels = num_labels
         self.adapter_r = adapter_r
 
-    def _get_domain_embedding(
-        self,
-        hidden_states: torch.Tensor,
-        domain_id: int | None,
-        domain_probs: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Return a domain embedding (embed_dim,) for gating."""
+    def _set_adapter_gates(self, domain_id: int | None, domain_probs: torch.Tensor | None):
+        """Compute and set gate vectors on adapters BEFORE the encoder forward pass."""
         if domain_id is not None:
-            return self.domain_embeddings(domain_id)
-        if domain_probs is not None:
-            return soft_mixture_routing(self.domain_embeddings, domain_probs)
-        # Inference: use domain classifier output for soft routing
-        domain_logits = self.domain_classifier(hidden_states)
-        # Average over batch dimension before softmax
-        mean_logits = domain_logits.mean(0)
-        probs = F.softmax(mean_logits, dim=0)
-        return soft_mixture_routing(self.domain_embeddings, probs)
+            domain_emb = self.domain_embeddings(domain_id)
+        elif domain_probs is not None:
+            domain_emb = soft_mixture_routing(self.domain_embeddings, domain_probs)
+        else:
+            # Will be set to None → adapters run un-gated; domain classifier
+            # routing happens in a second pass (see forward).
+            for adapter in self.adapters:
+                adapter.set_gate(None)
+            return
+
+        for adapter, gate_layer in zip(self.adapters, self.gating_layers):
+            gate = gate_layer(domain_emb)  # (adapter_r,)
+            adapter.set_gate(gate)
 
     def forward(
         self,
@@ -149,27 +158,44 @@ class DualReplayModel(nn.Module):
         """
         Returns (task_logits, domain_logits).
 
-        domain_id: known at training time -> direct embedding lookup.
-        domain_id=None at inference -> soft routing via domain classifier.
+        domain_id: known at training time -> direct embedding lookup + gating.
+        domain_id=None at inference -> ensemble over all domains weighted by
+            domain classifier probs (avoids unreliable ungated forward pass).
         """
-        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs.last_hidden_state  # (B, T, d)
+        if domain_id is not None or domain_probs is not None:
+            # Training or known-domain: set gates then run encoder once
+            self._set_adapter_gates(domain_id, domain_probs)
+            outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+            hidden_states = outputs.last_hidden_state
 
-        # Domain embedding for gating (compute gates, used as diagnostic/auxiliary)
-        domain_emb = self._get_domain_embedding(hidden_states, domain_id, domain_probs)
-        # Gates per layer (currently used for auxiliary learning signal)
-        gates = [gate_layer(domain_emb) for gate_layer in self.gating_layers]
+            cls_hidden = hidden_states[:, 0, :]
+            domain_logits = self.domain_classifier(hidden_states)
+            task_logits = self.classifier(cls_hidden)
+            return task_logits, domain_logits
+        else:
+            # Inference: run each domain's gating, collect task logits, then
+            # weight by domain classifier probs for a per-sample ensemble.
+            all_task_logits = []
+            domain_logits_accum = None
 
-        # CLS token for classification
-        cls_hidden = hidden_states[:, 0, :]  # (B, d_model)
+            for d in range(self.num_domains):
+                self._set_adapter_gates(d, None)
+                outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+                h = outputs.last_hidden_state
+                cls_h = h[:, 0, :]
+                all_task_logits.append(self.classifier(cls_h))  # (B, num_labels)
+                if domain_logits_accum is None:
+                    domain_logits_accum = self.domain_classifier(h)
 
-        # Domain logits from full sequence (mean pooling inside DomainClassifier)
-        domain_logits = self.domain_classifier(hidden_states)  # (B, num_domains)
+            # Stack: (num_domains, B, num_labels)
+            stacked = torch.stack(all_task_logits, dim=0)
+            # Domain probs per sample: (B, num_domains)
+            domain_probs_per_sample = F.softmax(domain_logits_accum, dim=-1)
+            # Weighted ensemble: (B, num_labels)
+            weights = domain_probs_per_sample.T.unsqueeze(-1)  # (num_domains, B, 1)
+            task_logits = (stacked * weights).sum(dim=0)
 
-        # Task logits
-        task_logits = self.classifier(cls_hidden)  # (B, num_labels)
-
-        return task_logits, domain_logits
+            return task_logits, domain_logits_accum
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +209,7 @@ class DualReplay(BaseContinualMethod):
         self,
         model_name: str,
         num_domains: int,
-        learning_rate: float = 2e-4,
+        learning_rate: float = 2e-5,
         epochs: int = 3,
         batch_size: int = 16,
         max_seq_len: int = 128,
@@ -203,11 +229,14 @@ class DualReplay(BaseContinualMethod):
         self.max_seq_len = max_seq_len
         self.adapter_r = adapter_r
         self.embed_dim = embed_dim
+        self.unfreeze_top_k: int = kwargs.get("unfreeze_top_k", 0)
         self.replay_ratio = replay_ratio
         self.domain_replay_fraction = domain_replay_fraction
         self.domain_buffer_size = domain_buffer_size
         self.general_buffer_size = general_buffer_size
         self._default_num_labels = num_labels
+        self.gradient_accumulation_steps: int = kwargs.get("gradient_accumulation_steps", 1)
+        self.warmup_ratio: float = kwargs.get("warmup_ratio", 0.1)
 
         self.model: DualReplayModel | None = None
         self.tokenizer = None
@@ -237,21 +266,34 @@ class DualReplay(BaseContinualMethod):
         self.replay_buffer.fill_general(data)
 
     def _ensure_model(self, num_labels: int):
-        """Create model on first call; no-op if already created."""
-        if self.model is not None:
-            return
-        self._num_labels = num_labels
-        self.model = DualReplayModel(
-            model_name=self.model_name,
-            num_domains=self.num_domains,
-            num_labels=num_labels,
-            adapter_r=self.adapter_r,
-            embed_dim=self.embed_dim,
-        ).to(self.device)
+        """Create model on first call; resize classifier head if label space grows."""
+        if self.model is None:
+            self._num_labels = num_labels
+            self.model = DualReplayModel(
+                model_name=self.model_name,
+                num_domains=self.num_domains,
+                num_labels=num_labels,
+                adapter_r=self.adapter_r,
+                embed_dim=self.embed_dim,
+                unfreeze_top_k=self.unfreeze_top_k,
+            ).to(self.device)
+        elif num_labels > self._num_labels:
+            # Grow the classifier head to accommodate new labels
+            d_model = self.model.classifier.in_features
+            old_weight = self.model.classifier.weight.data
+            old_bias = self.model.classifier.bias.data
+            self.model.classifier = nn.Linear(d_model, num_labels).to(self.device)
+            # Copy old weights for existing classes
+            self.model.classifier.weight.data[:self._num_labels] = old_weight
+            self.model.classifier.bias.data[:self._num_labels] = old_bias
+            self._num_labels = num_labels
 
-    def _build_optimizer(self):
-        trainable = [p for p in self.model.parameters() if p.requires_grad]
-        return torch.optim.AdamW(trainable, lr=self.learning_rate)
+    def _build_optimizer(self, num_training_steps: int):
+        optimizer, scheduler = build_optimizer_and_scheduler(
+            self.model, self.learning_rate, num_training_steps,
+            warmup_ratio=self.warmup_ratio,
+        )
+        return optimizer, scheduler
 
     def _compose_batch(
         self,
@@ -303,14 +345,20 @@ class DualReplay(BaseContinualMethod):
         self._ensure_model(num_labels)
 
         self.model.train()
-        optimizer = self._build_optimizer()
         rng = random.Random(domain_id)
+
+        # Estimate steps for scheduler: use train_data size as proxy for loader length per epoch
+        n_total = len(train_data)
+        est_batches_per_epoch = math.ceil(n_total / self.batch_size)
+        steps_per_epoch = math.ceil(est_batches_per_epoch / self.gradient_accumulation_steps)
+        num_training_steps = steps_per_epoch * self.epochs
+
+        optimizer, scheduler = self._build_optimizer(num_training_steps)
 
         total_loss = 0.0
         total_steps = 0
 
         for _epoch in range(self.epochs):
-            n_total = len(train_data)
             mixed_data = self._compose_batch(train_data, domain_id, n_total, rng)
 
             dataset = _DualReplayDataset(mixed_data, self.tokenizer, self.max_seq_len)
@@ -321,7 +369,7 @@ class DualReplay(BaseContinualMethod):
                 drop_last=False,
             )
 
-            for batch in loader:
+            for batch_idx, batch in enumerate(loader):
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels_tensor = batch["label"].to(self.device)
@@ -352,12 +400,20 @@ class DualReplay(BaseContinualMethod):
                     loss = loss + 0.1 * domain_loss
 
                 if loss.requires_grad:
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
+                    scaled_loss = loss / self.gradient_accumulation_steps
+                    scaled_loss.backward()
 
-                total_loss += loss.item()
-                total_steps += 1
+                    total_loss += loss.item()
+
+                    if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(loader):
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        optimizer.step()
+                        scheduler.step()
+                        optimizer.zero_grad()
+                        total_steps += 1
+                else:
+                    total_loss += loss.item()
+                    total_steps += 1
 
         # Store current domain examples into replay buffer after training
         self.replay_buffer.add_domain(domain_id, train_data)
