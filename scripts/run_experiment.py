@@ -33,16 +33,23 @@ METHOD_MAP = {
 
 
 def load_config(config_name: str) -> dict:
-    config_path = os.path.join(
+    config_dir = os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "configs",
-        "default.yaml",
     )
+    config_path = os.path.join(config_dir, "default.yaml")
     with open(config_path) as f:
         all_configs = yaml.safe_load(f)
     if config_name not in all_configs:
         raise ValueError(f"Config '{config_name}' not found. Available: {list(all_configs.keys())}")
-    return all_configs[config_name]
+    config = dict(all_configs[config_name])
+    # Apply autoresearch overrides if present
+    override_path = os.path.join(config_dir, "autoresearch_override.yaml")
+    if config_name == "autoresearch" and os.path.exists(override_path):
+        with open(override_path) as f:
+            overrides = yaml.safe_load(f) or {}
+        config.update(overrides)
+    return config
 
 
 def get_method(method_name: str, config: dict):
@@ -51,6 +58,11 @@ def get_method(method_name: str, config: dict):
     module_path, class_name = METHOD_MAP[method_name]
     mod = importlib.import_module(module_path)
     cls = getattr(mod, class_name)
+
+    # Apply per-method overrides if present
+    method_overrides = config.pop("method_overrides", None) or {}
+    if method_name in method_overrides:
+        config.update(method_overrides[method_name])
 
     # Map config keys to constructor kwargs.
     # Some configs use "epochs_per_domain" but methods expect "epochs".

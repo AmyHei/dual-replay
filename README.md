@@ -97,14 +97,46 @@ results/              Experiment outputs (gitignored)
 uv run pytest tests/ -v
 ```
 
+## Experiment Progress (as of 2026-04-08)
+
+### Phase 1: Autoresearch (proxy tuning) — COMPLETE
+
+380+ experiments on bert-tiny (5 domains) to find optimal hyperparameters per method.
+Best proxy results stored in `results/autoresearch/`. Scaling rules applied to `clinc150` config.
+
+### Phase 2: Full clinc150 runs (bert-large, 15 domains) — 8/40
+
+| Method | Seeds Done | Current F1 | Target F1 | Target BWT | Status |
+|--------|-----------|------------|-----------|------------|--------|
+| Sequential FT | 5/5 | 25.8 ± 2.1 | 79.3 ± 2.1 | -21.4 ± 3.0 | **Needs LR fix** |
+| EWC | 2/5 | 27.0 ± 0.1 | 81.2 | -15.1 | **Needs LR fix** |
+| LoRA-Only | 0/5 | — | 83.1 ± 1.5 | -12.8 ± 2.1 | Not started |
+| Replay-Only | 0/5 | — | 84.0 ± 1.4 | -10.5 ± 1.8 | Not started |
+| LoRA+Replay | 0/5 | — | 84.7 ± 1.3 | -8.9 ± 1.6 | Not started |
+| O-LoRA | 0/5 | — | 84.2 ± 1.2 | -7.5 ± 1.4 | Not started |
+| DER (LoRA) | 0/5 | — | 85.3 ± 1.3 | -7.8 ± 1.5 | Not started |
+| **Dual-Replay** | **1/5** | **88.3** | **89.1 ± 1.0** | **-5.2 ± 1.0** | **On target** |
+
+**Known issue**: Full-FT baselines (sequential_ft, ewc) get ~25-27 F1 on bert-large, far below targets.
+The proxy→full LR scaling (÷8) may be too aggressive for full-FT methods. Dual-Replay (adapter-based) scales correctly.
+
+### Next Steps
+
+1. **[BLOCKER] Fix full-FT baseline LR**: The `1.5e-5` LR for sequential_ft/ewc on bert-large is too low.
+   Try `2e-5` to `5e-5` (standard BERT-large fine-tuning range). Run single seed to validate.
+2. **Re-run sequential_ft & ewc** with corrected LR (5 seeds each).
+3. **Run remaining methods**: lora_only, replay_only, lora_replay, o_lora, der (5 seeds each).
+4. **Complete dual_replay**: seeds 123, 456, 789, 1024.
+5. **Phase 3**: T5-base validation (after Phase 2 is complete).
+
 ## Reproduction Targets (Paper Table 9)
 
 | Method | Target F1 | Target BWT |
 |--------|-----------|------------|
-| Sequential FT | 79.3 +/- 2.1 | -21.4 +/- 3.0 |
-| LoRA-Only | 83.1 +/- 1.5 | -12.8 +/- 2.1 |
-| Replay-Only | 84.0 +/- 1.4 | -10.5 +/- 1.8 |
-| LoRA+Replay | 84.7 +/- 1.3 | -8.9 +/- 1.6 |
-| O-LoRA | 84.2 +/- 1.2 | -7.5 +/- 1.4 |
-| DER (LoRA) | 85.3 +/- 1.3 | -7.8 +/- 1.5 |
-| **Dual-Replay** | **89.1 +/- 1.0** | **-5.2 +/- 1.0** |
+| Sequential FT | 79.3 ± 2.1 | -21.4 ± 3.0 |
+| LoRA-Only | 83.1 ± 1.5 | -12.8 ± 2.1 |
+| Replay-Only | 84.0 ± 1.4 | -10.5 ± 1.8 |
+| LoRA+Replay | 84.7 ± 1.3 | -8.9 ± 1.6 |
+| O-LoRA | 84.2 ± 1.2 | -7.5 ± 1.4 |
+| DER (LoRA) | 85.3 ± 1.3 | -7.8 ± 1.5 |
+| **Dual-Replay** | **89.1 ± 1.0** | **-5.2 ± 1.0** |

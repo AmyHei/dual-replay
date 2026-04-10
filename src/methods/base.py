@@ -27,7 +27,7 @@ class BaseContinualMethod(ABC):
         ...
 
     @abstractmethod
-    def run_evaluation(self, test_data: list[dict]) -> dict[str, float]:
+    def run_evaluation(self, test_data: list[dict], valid_labels: list[int] | None = None) -> dict[str, float]:
         ...
 
     def get_trainable_param_count(self) -> int:

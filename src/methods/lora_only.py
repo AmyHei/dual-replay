@@ -1,11 +1,15 @@
 """LoRA-only baseline: LoRA fine-tuning without any replay."""
+import math
 import torch
 from torch.utils.data import DataLoader
 from peft import get_peft_model, LoraConfig, TaskType
 from sklearn.metrics import f1_score
 
 from src.methods.base import BaseContinualMethod
-from src.methods.utils import TextDataset, _load_model_for_classification, _load_tokenizer
+from src.methods.utils import (
+    TextDataset, _load_model_for_classification, _load_tokenizer,
+    build_optimizer_and_scheduler, resize_classifier, masked_argmax,
+)
 
 
 class LoRAOnly(BaseContinualMethod):
@@ -20,6 +24,8 @@ class LoRAOnly(BaseContinualMethod):
         self.lora_r: int = kwargs.get("lora_r", 16)
         self.lora_alpha: int = kwargs.get("lora_alpha", 32)
         self.lora_dropout: float = kwargs.get("lora_dropout", 0.1)
+        self.gradient_accumulation_steps: int = kwargs.get("gradient_accumulation_steps", 1)
+        self.warmup_ratio: float = kwargs.get("warmup_ratio", 0.1)
 
         self.tokenizer = None
         self.model = None
@@ -29,7 +35,7 @@ class LoRAOnly(BaseContinualMethod):
         self.tokenizer = _load_tokenizer(self.model_name)
 
     def _ensure_model(self, num_labels: int):
-        if self.model is None or num_labels > self._num_labels:
+        if self.model is None:
             self._num_labels = num_labels
             base_model = _load_model_for_classification(self.model_name, num_labels)
             lora_config = LoraConfig(
@@ -41,6 +47,10 @@ class LoRAOnly(BaseContinualMethod):
             )
             self.model = get_peft_model(base_model, lora_config)
             self.model.to(self.device)
+        elif num_labels > self._num_labels:
+            base = self.model.base_model.model
+            resize_classifier(base, self._num_labels, num_labels, self.device)
+            self._num_labels = num_labels
 
     def train_domain(
         self,
@@ -56,35 +66,44 @@ class LoRAOnly(BaseContinualMethod):
         dataset = TextDataset(combined, self.tokenizer, self.max_seq_len)
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(trainable_params, lr=self.learning_rate)
+        steps_per_epoch = math.ceil(len(loader) / self.gradient_accumulation_steps)
+        num_training_steps = steps_per_epoch * self.epochs
+
+        optimizer, scheduler = build_optimizer_and_scheduler(
+            self.model, self.learning_rate, num_training_steps,
+            warmup_ratio=self.warmup_ratio,
+        )
 
         self.model.train()
         total_loss = 0.0
         steps = 0
 
         for _ in range(self.epochs):
-            for batch in loader:
+            for batch_idx, batch in enumerate(loader):
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
 
-                optimizer.zero_grad()
                 outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     labels=labels,
                 )
-                loss = outputs.loss
+                loss = outputs.loss / self.gradient_accumulation_steps
                 loss.backward()
-                optimizer.step()
 
-                total_loss += loss.item()
-                steps += 1
+                total_loss += loss.item() * self.gradient_accumulation_steps
+
+                if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(loader):
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    steps += 1
 
         return {"loss": total_loss / max(steps, 1)}
 
-    def run_evaluation(self, test_data: list) -> dict:
+    def run_evaluation(self, test_data, valid_labels=None):
         if self.model is None:
             raise RuntimeError("Model not yet trained; call train_domain first.")
 
@@ -102,7 +121,7 @@ class LoRAOnly(BaseContinualMethod):
                 labels = batch["labels"]
 
                 outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-                preds = outputs.logits.argmax(dim=-1).cpu().tolist()
+                preds = masked_argmax(outputs.logits, valid_labels).cpu().tolist()
                 all_preds.extend(preds)
                 all_labels.extend(labels.tolist())
 

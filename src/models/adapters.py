@@ -16,9 +16,18 @@ class BottleneckAdapter(nn.Module):
         self.up = nn.Linear(bottleneck_dim, d_model)
         nn.init.zeros_(self.up.weight)
         nn.init.zeros_(self.up.bias)
+        # Gate vector set externally before forward pass (by DualReplayModel)
+        self._gate: torch.Tensor | None = None
+
+    def set_gate(self, gate: torch.Tensor | None):
+        """Set a (bottleneck_dim,) gate vector for task-conditioned modulation."""
+        self._gate = gate
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
-        return h + self.up(self.activation(self.down(h)))
+        mid = self.activation(self.down(h))  # (..., bottleneck_dim)
+        if self._gate is not None:
+            mid = mid * self._gate  # element-wise gating
+        return h + self.up(mid)
 
 
 def _load_model(model_name: str):

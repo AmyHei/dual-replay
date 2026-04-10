@@ -4,13 +4,17 @@ Simplified: maintain per-domain LoRA adapters and merge after each domain.
 The merged weights serve as a frozen base for the next adapter, approximating
 the orthogonal subspace constraint without expensive SVD at each step.
 """
+import math
 import torch
 from torch.utils.data import DataLoader
 from peft import get_peft_model, LoraConfig, TaskType
 from sklearn.metrics import f1_score
 
 from src.methods.base import BaseContinualMethod
-from src.methods.utils import TextDataset, _load_model_for_classification, _load_tokenizer
+from src.methods.utils import (
+    TextDataset, _load_model_for_classification, _load_tokenizer,
+    build_optimizer_and_scheduler, resize_classifier, masked_argmax,
+)
 
 
 class OLoRA(BaseContinualMethod):
@@ -25,6 +29,8 @@ class OLoRA(BaseContinualMethod):
         self.adapter_r: int = kwargs.get("lora_r", 16)
         self.adapter_alpha: int = kwargs.get("lora_alpha", 32)
         self.adapter_drop: float = kwargs.get("lora_dropout", 0.1)
+        self.gradient_accumulation_steps: int = kwargs.get("gradient_accumulation_steps", 1)
+        self.warmup_ratio: float = kwargs.get("warmup_ratio", 0.1)
 
         self.tokenizer = None
         self.model = None
@@ -43,11 +49,15 @@ class OLoRA(BaseContinualMethod):
         )
 
     def _ensure_model(self, num_labels: int):
-        if self.model is None or num_labels > self._num_labels:
+        if self.model is None:
             self._num_labels = num_labels
             base_model = _load_model_for_classification(self.model_name, num_labels)
             self.model = get_peft_model(base_model, self._make_lora_config())
             self.model.to(self.device)
+        elif num_labels > self._num_labels:
+            base = self.model.base_model.model
+            resize_classifier(base, self._num_labels, num_labels, self.device)
+            self._num_labels = num_labels
 
     def train_domain(
         self,
@@ -63,26 +73,36 @@ class OLoRA(BaseContinualMethod):
         dataset = TextDataset(combined, self.tokenizer, self.max_seq_len)
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
-        trainable = [p for p in self.model.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(trainable, lr=self.learning_rate)
+        steps_per_epoch = math.ceil(len(loader) / self.gradient_accumulation_steps)
+        num_training_steps = steps_per_epoch * self.epochs
+
+        optimizer, scheduler = build_optimizer_and_scheduler(
+            self.model, self.learning_rate, num_training_steps,
+            warmup_ratio=self.warmup_ratio,
+        )
 
         self.model.train()
         total_loss = 0.0
         steps = 0
 
         for _ in range(self.epochs):
-            for batch in loader:
+            for batch_idx, batch in enumerate(loader):
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
 
-                optimizer.zero_grad()
                 out = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                out.loss.backward()
-                optimizer.step()
+                loss = out.loss / self.gradient_accumulation_steps
+                loss.backward()
 
-                total_loss += out.loss.item()
-                steps += 1
+                total_loss += loss.item() * self.gradient_accumulation_steps
+
+                if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(loader):
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    steps += 1
 
         # Merge adapter into base and attach a fresh adapter for next domain
         import logging
@@ -95,7 +115,7 @@ class OLoRA(BaseContinualMethod):
 
         return {"loss": total_loss / max(steps, 1)}
 
-    def run_evaluation(self, test_data: list) -> dict:
+    def run_evaluation(self, test_data, valid_labels=None):
         if self.model is None:
             raise RuntimeError("Model not yet trained; call train_domain first.")
 
@@ -113,7 +133,7 @@ class OLoRA(BaseContinualMethod):
                 labels = batch["labels"]
 
                 out = self.model(input_ids=input_ids, attention_mask=attention_mask)
-                preds = out.logits.argmax(dim=-1).cpu().tolist()
+                preds = masked_argmax(out.logits, valid_labels).cpu().tolist()
                 all_preds.extend(preds)
                 all_labels.extend(labels.tolist())
 

@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score, accuracy_score
 
 from src.methods.base import BaseContinualMethod
-from src.methods.utils import _load_tokenizer, build_optimizer_and_scheduler
+from src.methods.utils import _load_tokenizer, build_optimizer_and_scheduler, masked_argmax
 from src.models.adapters import (
     BottleneckAdapter,
     _load_model,
@@ -422,7 +422,7 @@ class DualReplay(BaseContinualMethod):
         avg_loss = total_loss / max(1, total_steps)
         return {"loss": avg_loss}
 
-    def run_evaluation(self, test_data: list[dict]) -> dict[str, float]:
+    def run_evaluation(self, test_data: list[dict], valid_labels=None) -> dict[str, float]:
         if self.model is None:
             raise RuntimeError("Must call train_domain() before evaluation.")
         self.model.eval()
@@ -446,7 +446,7 @@ class DualReplay(BaseContinualMethod):
                     domain_id=None,
                 )
 
-                preds = task_logits.argmax(dim=-1).cpu()
+                preds = masked_argmax(task_logits, valid_labels).cpu()
                 valid = labels_tensor >= 0
                 all_preds.extend(preds[valid].tolist())
                 all_labels.extend(labels_tensor[valid].tolist())

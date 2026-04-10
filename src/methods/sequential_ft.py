@@ -1,11 +1,16 @@
 """Sequential fine-tuning baseline: full-model FT on each domain with no forgetting mitigation."""
+import math
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score
 
 from src.methods.base import BaseContinualMethod
-from src.methods.utils import TextDataset, _load_model_for_classification, _load_tokenizer
+from src.methods.utils import (
+    TextDataset, _load_model_for_classification, _load_tokenizer,
+    build_optimizer_and_scheduler, resize_classifier, masked_argmax,
+    masked_cross_entropy,
+)
 
 
 class SequentialFT(BaseContinualMethod):
@@ -17,6 +22,8 @@ class SequentialFT(BaseContinualMethod):
         self.epochs: int = kwargs.get("epochs", 3)
         self.batch_size: int = kwargs.get("batch_size", 16)
         self.max_seq_len: int = kwargs.get("max_seq_len", 128)
+        self.gradient_accumulation_steps: int = kwargs.get("gradient_accumulation_steps", 1)
+        self.warmup_ratio: float = kwargs.get("warmup_ratio", 0.1)
 
         self.tokenizer = None
         self.model: nn.Module | None = None
@@ -46,8 +53,12 @@ class SequentialFT(BaseContinualMethod):
         dataset = TextDataset(combined, self.tokenizer, self.max_seq_len)
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
 
-        optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=self.learning_rate
+        steps_per_epoch = math.ceil(len(loader) / self.gradient_accumulation_steps)
+        num_training_steps = steps_per_epoch * self.epochs
+
+        optimizer, scheduler = build_optimizer_and_scheduler(
+            self.model, self.learning_rate, num_training_steps,
+            warmup_ratio=self.warmup_ratio,
         )
 
         self.model.train()
@@ -55,35 +66,38 @@ class SequentialFT(BaseContinualMethod):
         steps = 0
 
         for _ in range(self.epochs):
-            for batch in loader:
+            for batch_idx, batch in enumerate(loader):
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
 
-                optimizer.zero_grad()
                 outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     labels=labels,
                 )
-                loss = outputs.loss
+                loss = outputs.loss / self.gradient_accumulation_steps
                 loss.backward()
-                optimizer.step()
 
-                total_loss += loss.item()
-                steps += 1
+                total_loss += loss.item() * self.gradient_accumulation_steps
+
+                if (batch_idx + 1) % self.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(loader):
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    steps += 1
 
         return {"loss": total_loss / max(steps, 1)}
 
-    def run_evaluation(self, test_data: list[dict]) -> dict[str, float]:
-        """Compute macro-averaged F1 on test_data."""
+    def run_evaluation(self, test_data: list[dict], valid_labels: list[int] | None = None) -> dict[str, float]:
+        """Compute macro-averaged F1 on test_data with optional label masking."""
         if self.model is None:
             raise RuntimeError("Model not yet trained; call train_domain first.")
 
         dataset = TextDataset(test_data, self.tokenizer, self.max_seq_len)
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
 
-        # Switch model to inference mode
         self.model.eval()
         all_preds: list[int] = []
         all_labels: list[int] = []
@@ -98,7 +112,7 @@ class SequentialFT(BaseContinualMethod):
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                 )
-                preds = outputs.logits.argmax(dim=-1).cpu().tolist()
+                preds = masked_argmax(outputs.logits, valid_labels).cpu().tolist()
                 all_preds.extend(preds)
                 all_labels.extend(labels.tolist())
 
@@ -116,7 +130,10 @@ class SequentialFT(BaseContinualMethod):
 
     def _ensure_model(self, num_labels: int):
         """Create or resize the classification head when the label space grows."""
-        if self.model is None or num_labels > self._num_labels:
+        if self.model is None:
             self._num_labels = num_labels
             self.model = _load_model_for_classification(self.model_name, num_labels)
             self.model.to(self.device)
+        elif num_labels > self._num_labels:
+            resize_classifier(self.model, self._num_labels, num_labels, self.device)
+            self._num_labels = num_labels
