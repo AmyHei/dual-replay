@@ -49,7 +49,7 @@ clinc150:
   gradient_accumulation_steps: 4   # effective batch = 8*4 = 32
   adapter_r: 64
   max_seq_len: 128
-  domain_buffer_size: 200
+  domain_buffer_size: 500            # tuned: 500 > 200 for replay coverage
   general_buffer_size: 1000
   learning_rate: 1.5e-5             # full-FT methods (scaled from autoresearch: 1e-4 ÷ 8)
   warmup_ratio: 0.15                # autoresearch found 0.15 > 0.1
@@ -69,6 +69,7 @@ clinc150:
       warmup_ratio: 0.1
     replay_only:                       # proxy: F1=83.8, lr=5e-4, epochs=5
       learning_rate: 6.0e-5
+      replay_ratio: 0.50              # more replay for class-incremental retention
     lora_only:                         # proxy: F1=36.7, lr=5e-4, adapter_r=4→scale to 64
       learning_rate: 6.0e-5
     lora_replay:                       # proxy: F1=63.2, lr=2e-3, epochs=5, replay=0.3
@@ -83,7 +84,7 @@ clinc150:
       warmup_ratio: 0.15
     dual_replay:                       # proxy: F1=77.0, lr=5e-4, adapter_r=16, unfreeze=2/2
       learning_rate: 6.25e-5           # 5e-4 ÷ 8 (dim_tiny/dim_large)
-      replay_ratio: 0.40               # higher replay critical for dual_replay
+      replay_ratio: 0.40               # original ratio, larger buffer provides variety
       warmup_ratio: 0.15
       unfreeze_top_k: 4                # 2/2 layers on tiny ≈ 4/24 on large (~17%)
 
