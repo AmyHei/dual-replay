@@ -130,8 +130,21 @@ class DualReplayModel(nn.Module):
             for _ in layers
         ])
 
-        # Domain classifier trained alongside adapters
+        # Trainable domain classifier: kept for auxiliary training signal.
+        # NOT used for inference routing — prototypes (below) are used instead.
         self.domain_classifier = DomainClassifier(d_model, num_domains)
+
+        # Prototype-based routing buffers: one mean frozen-encoder embedding
+        # per domain, stored after its training phase and never updated again.
+        # Routing at inference = cosine similarity to prototypes, no trainable
+        # weights to drift in sequential CL.
+        self.register_buffer(
+            "domain_prototypes", torch.zeros(num_domains, d_model)
+        )
+        self.register_buffer(
+            "prototype_initialized", torch.zeros(num_domains, dtype=torch.bool)
+        )
+        self.routing_temperature: float = 0.1
 
         # Per-domain task heads: each domain gets its own head, sized to its label count.
         # Assumes uniform labels_per_domain (common in CL benchmarks like CLINC150).
@@ -153,6 +166,33 @@ class DualReplayModel(nn.Module):
     def _set_adapters_bypass(self, bypass: bool):
         for adapter in self.adapters:
             adapter.set_bypass(bypass)
+
+    @staticmethod
+    def _masked_mean_pool(
+        hidden: torch.Tensor, attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Mean-pool over tokens ignoring padding."""
+        mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
+        return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+
+    def set_prototype(self, domain_id: int, prototype: torch.Tensor):
+        self.domain_prototypes.data[domain_id] = prototype.detach()
+        self.prototype_initialized.data[domain_id] = True
+
+    def _prototype_routing(
+        self, frozen_hidden: torch.Tensor, attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Return log_domain_probs shape (B, num_domains) from cosine similarity
+        between mean-pooled frozen-encoder output and each domain's prototype.
+        Uninitialized prototypes get -1e4 score → softmax ≈ 0."""
+        query = self._masked_mean_pool(frozen_hidden, attention_mask)  # (B, d)
+        query_n = F.normalize(query, dim=-1)
+        proto_n = F.normalize(self.domain_prototypes, dim=-1)           # (K, d)
+        sim = query_n @ proto_n.T                                       # (B, K)
+        # Mask uninitialized domains
+        not_init = ~self.prototype_initialized.view(1, -1)
+        sim = sim.masked_fill(not_init, -1e4)
+        return F.log_softmax(sim / self.routing_temperature, dim=-1)
 
     def _set_adapter_gates(self, domain_id: int | None, domain_probs: torch.Tensor | None):
         """Compute and set gate vectors on adapters BEFORE the encoder forward pass."""
@@ -234,7 +274,10 @@ class DualReplayModel(nn.Module):
             B = stacked.shape[1]
             device = stacked.device
 
-            log_domain_probs = F.log_softmax(domain_logits, dim=-1)
+            # Route via prototypes (no trainable weights that can drift in CL)
+            log_domain_probs = self._prototype_routing(
+                frozen_out.last_hidden_state, attention_mask
+            )
 
             task_logits = torch.full(
                 (B, self.num_labels), -1e4, device=device, dtype=stacked.dtype
@@ -471,8 +514,35 @@ class DualReplay(BaseContinualMethod):
         self.replay_buffer.add_domain(domain_id, train_data)
         self.current_domain = domain_id
 
+        # Compute and store the domain's prototype from frozen-encoder mean-pool
+        # over its training data. Used at inference by prototype routing.
+        self._update_prototype(domain_id, train_data)
+
         avg_loss = total_loss / max(1, total_steps)
         return {"loss": avg_loss}
+
+    def _update_prototype(self, domain_id: int, train_data: list[dict]):
+        """Mean frozen-encoder mean-pool on domain_id's training data."""
+        self.model.eval()
+        self.model._set_adapters_bypass(True)
+        dataset = _DualReplayDataset(train_data, self.tokenizer, self.max_seq_len)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
+        d_model = self.model.encoder.config.hidden_size
+        sum_pool = torch.zeros(d_model, device=self.device)
+        total = 0
+        with torch.no_grad():
+            for batch in loader:
+                input_ids = batch["input_ids"].to(self.device)
+                attention_mask = batch["attention_mask"].to(self.device)
+                out = self.model.encoder(input_ids=input_ids, attention_mask=attention_mask)
+                pooled = self.model._masked_mean_pool(
+                    out.last_hidden_state, attention_mask
+                )
+                sum_pool += pooled.sum(dim=0)
+                total += pooled.shape[0]
+        self.model._set_adapters_bypass(False)
+        if total > 0:
+            self.model.set_prototype(domain_id, sum_pool / total)
 
     def run_evaluation(
         self,
