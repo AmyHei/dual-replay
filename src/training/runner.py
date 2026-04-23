@@ -49,8 +49,9 @@ class SequentialRunner:
         "test":  list[dict]   (same structure)
 
     Uses contiguous labels (domain 0 → 0-9, domain 1 → 10-19, etc.) with
-    class-incremental evaluation: at test time, the model predicts among ALL
-    seen classes (no domain ID known), not just the current domain's labels.
+    class-incremental evaluation: at step `step`, predictions are masked to
+    the union of labels from all domains seen so far (0..step). No domain ID
+    is leaked at test time.
     """
 
     def __init__(self, method: BaseContinualMethod, domains: list[dict]):
@@ -77,14 +78,24 @@ class SequentialRunner:
 
         self.method.setup()
 
+        # Collect per-domain label sets
+        domain_labels: list[list[int]] = []
+        for dom in prepared_domains:
+            labels = sorted(set(ex["label"] for ex in dom["train"] if ex["label"] >= 0))
+            domain_labels.append(labels)
+
         for step, domain in enumerate(prepared_domains):
             self.method.train_domain(
                 domain_id=domain["domain_id"],
                 train_data=domain["train"],
             )
+            # Class-incremental: valid labels = union of all seen domains' labels
+            seen_labels = sorted(set().union(*domain_labels[: step + 1]))
             for j in range(step + 1):
-                # Class-incremental eval: no label masking, argmax over all classes
-                result = self.method.run_evaluation(prepared_domains[j]["test"])
+                result = self.method.run_evaluation(
+                    prepared_domains[j]["test"],
+                    valid_labels=seen_labels,
+                )
                 perf_matrix[step, j] = result["f1"]
 
         final_scores = perf_matrix[K - 1, :]

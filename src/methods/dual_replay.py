@@ -79,7 +79,15 @@ class _DualReplayDataset(torch.utils.data.Dataset):
 # ---------------------------------------------------------------------------
 
 class DualReplayModel(nn.Module):
-    """Full model: frozen encoder + adapters + gating + domain classifier + task head."""
+    """Full model: frozen encoder + adapters + gating + domain classifier + per-domain task heads.
+
+    Per-domain heads: each domain has its own (d_model, labels_per_domain) linear head.
+    During training, per-sample head routing ensures each sample's task loss flows only
+    through its own domain's head — no cross-head interference.
+    At inference, global task logits are a log-probability mixture:
+        log p(label|x) = log p(domain=d|x) + log p(label|domain=d, x)
+    where the first term is the domain classifier and the second uses head_d.
+    """
 
     def __init__(
         self,
@@ -89,6 +97,7 @@ class DualReplayModel(nn.Module):
         adapter_r: int = 64,
         embed_dim: int = 64,
         unfreeze_top_k: int = 0,
+        labels_per_domain: int | None = None,
     ):
         super().__init__()
         # Load and freeze base encoder
@@ -124,12 +133,26 @@ class DualReplayModel(nn.Module):
         # Domain classifier trained alongside adapters
         self.domain_classifier = DomainClassifier(d_model, num_domains)
 
-        # Task classification head
-        self.classifier = nn.Linear(d_model, num_labels)
+        # Per-domain task heads: each domain gets its own head, sized to its label count.
+        # Assumes uniform labels_per_domain (common in CL benchmarks like CLINC150).
+        if labels_per_domain is None:
+            assert num_labels % num_domains == 0, (
+                f"num_labels ({num_labels}) must be divisible by num_domains ({num_domains}) "
+                f"when labels_per_domain is not specified"
+            )
+            labels_per_domain = num_labels // num_domains
+        self.labels_per_domain = labels_per_domain
+        self.heads = nn.ModuleList([
+            nn.Linear(d_model, labels_per_domain) for _ in range(num_domains)
+        ])
 
         self.num_domains = num_domains
-        self.num_labels = num_labels
+        self.num_labels = num_domains * labels_per_domain
         self.adapter_r = adapter_r
+
+    def _set_adapters_bypass(self, bypass: bool):
+        for adapter in self.adapters:
+            adapter.set_bypass(bypass)
 
     def _set_adapter_gates(self, domain_id: int | None, domain_probs: torch.Tensor | None):
         """Compute and set gate vectors on adapters BEFORE the encoder forward pass."""
@@ -154,48 +177,77 @@ class DualReplayModel(nn.Module):
         attention_mask: torch.Tensor,
         domain_id: int | None = None,
         domain_probs: torch.Tensor | None = None,
+        sample_domain_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Returns (task_logits, domain_logits).
 
-        domain_id: known at training time -> direct embedding lookup + gating.
-        domain_id=None at inference -> ensemble over all domains weighted by
-            domain classifier probs (avoids unreliable ungated forward pass).
+        Paper 4.2: domain classifier uses the **frozen encoder's output**, i.e.
+        encoder with adapters bypassed. We run two encoder passes: one bypassed
+        (for domain classifier, consistent at train and test) and one gated
+        (for task heads). This avoids training/inference gate distribution
+        mismatch in the routing signal.
         """
+        # --- Domain classifier pass: frozen encoder (adapters bypassed) ---
+        self._set_adapters_bypass(True)
+        with torch.no_grad():
+            frozen_out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        self._set_adapters_bypass(False)
+        # domain_classifier is trainable; rerun it outside no_grad on cached hidden
+        domain_logits = self.domain_classifier(frozen_out.last_hidden_state)
+
         if domain_id is not None or domain_probs is not None:
-            # Training or known-domain: set gates then run encoder once
+            # Training (or known-domain eval): single gated encoder pass for task
             self._set_adapter_gates(domain_id, domain_probs)
             outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
             hidden_states = outputs.last_hidden_state
-
             cls_hidden = hidden_states[:, 0, :]
-            domain_logits = self.domain_classifier(hidden_states)
-            task_logits = self.classifier(cls_hidden)
+
+            B = cls_hidden.shape[0]
+            device = cls_hidden.device
+            task_logits = torch.full(
+                (B, self.num_labels), -1e4, device=device, dtype=cls_hidden.dtype
+            )
+            if sample_domain_ids is None:
+                sample_domain_ids = torch.full(
+                    (B,), domain_id if domain_id is not None else -1,
+                    dtype=torch.long, device=device,
+                )
+            for d_val in torch.unique(sample_domain_ids[sample_domain_ids >= 0]):
+                d_int = int(d_val.item())
+                sel = sample_domain_ids == d_val
+                sub_logits = self.heads[d_int](cls_hidden[sel])
+                start = d_int * self.labels_per_domain
+                task_logits[sel, start : start + self.labels_per_domain] = sub_logits
             return task_logits, domain_logits
         else:
-            # Inference: run each domain's gating, collect task logits, then
-            # weight by domain classifier probs for a per-sample ensemble.
-            all_task_logits = []
-            domain_logits_accum = None
-
+            # Inference: one gated encoder pass per domain for head output
+            all_local_logits = []
             for d in range(self.num_domains):
                 self._set_adapter_gates(d, None)
                 outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
                 h = outputs.last_hidden_state
                 cls_h = h[:, 0, :]
-                all_task_logits.append(self.classifier(cls_h))  # (B, num_labels)
-                if domain_logits_accum is None:
-                    domain_logits_accum = self.domain_classifier(h)
+                all_local_logits.append(self.heads[d](cls_h))
 
-            # Stack: (num_domains, B, num_labels)
-            stacked = torch.stack(all_task_logits, dim=0)
-            # Domain probs per sample: (B, num_domains)
-            domain_probs_per_sample = F.softmax(domain_logits_accum, dim=-1)
-            # Weighted ensemble: (B, num_labels)
-            weights = domain_probs_per_sample.T.unsqueeze(-1)  # (num_domains, B, 1)
-            task_logits = (stacked * weights).sum(dim=0)
+            stacked = torch.stack(all_local_logits, dim=0)
+            B = stacked.shape[1]
+            device = stacked.device
 
-            return task_logits, domain_logits_accum
+            log_domain_probs = F.log_softmax(domain_logits, dim=-1)
+
+            task_logits = torch.full(
+                (B, self.num_labels), -1e4, device=device, dtype=stacked.dtype
+            )
+            for d in range(self.num_domains):
+                local_log_probs = F.log_softmax(stacked[d], dim=-1)
+                log_weight_d = log_domain_probs[:, d].unsqueeze(-1)
+                start = d * self.labels_per_domain
+                task_logits[:, start : start + self.labels_per_domain] = (
+                    local_log_probs + log_weight_d
+                )
+
+            return task_logits, domain_logits
 
 
 # ---------------------------------------------------------------------------
@@ -248,16 +300,18 @@ class DualReplay(BaseContinualMethod):
     # ------------------------------------------------------------------
 
     def setup(self):
-        """Initialize tokenizer, replay buffer, and model."""
+        """Initialize tokenizer and replay buffer.
+
+        Model creation is deferred until `train_domain()` so that
+        `labels_per_domain` can be inferred from the first domain's actual
+        label count (e.g. 10 on CLINC150), not from a generic default.
+        """
         self.tokenizer = _load_tokenizer(self.model_name)
 
         self.replay_buffer = DualReplayBuffer(
             max_per_domain=self.domain_buffer_size,
             general_max_size=self.general_buffer_size,
         )
-
-        # Create model eagerly so callers can inspect parameters immediately
-        self._ensure_model(self._default_num_labels)
 
     def fill_general_buffer(self, data: list[dict]):
         """Populate the general replay stream."""
@@ -266,27 +320,24 @@ class DualReplay(BaseContinualMethod):
         self.replay_buffer.fill_general(data)
 
     def _ensure_model(self, num_labels: int):
-        """Create model on first call; resize classifier head if label space grows."""
+        """Create model on first call.
+
+        `num_labels` from the first domain's training data determines
+        labels_per_domain (assumes uniform per-domain label count, e.g. 10 on CLINC150).
+        All per-domain heads are allocated up front, no resizing needed.
+        """
         if self.model is None:
-            self._num_labels = num_labels
+            labels_per_domain = num_labels  # first-domain count = per-domain count
+            self._num_labels = self.num_domains * labels_per_domain
             self.model = DualReplayModel(
                 model_name=self.model_name,
                 num_domains=self.num_domains,
-                num_labels=num_labels,
+                num_labels=self._num_labels,
                 adapter_r=self.adapter_r,
                 embed_dim=self.embed_dim,
                 unfreeze_top_k=self.unfreeze_top_k,
+                labels_per_domain=labels_per_domain,
             ).to(self.device)
-        elif num_labels > self._num_labels:
-            # Grow the classifier head to accommodate new labels
-            d_model = self.model.classifier.in_features
-            old_weight = self.model.classifier.weight.data
-            old_bias = self.model.classifier.bias.data
-            self.model.classifier = nn.Linear(d_model, num_labels).to(self.device)
-            # Copy old weights for existing classes
-            self.model.classifier.weight.data[:self._num_labels] = old_weight
-            self.model.classifier.bias.data[:self._num_labels] = old_bias
-            self._num_labels = num_labels
 
     def _build_optimizer(self, num_training_steps: int):
         optimizer, scheduler = build_optimizer_and_scheduler(
@@ -379,6 +430,7 @@ class DualReplay(BaseContinualMethod):
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     domain_id=domain_id,
+                    sample_domain_ids=domain_tensor,
                 )
 
                 loss = torch.tensor(0.0, device=self.device)
@@ -397,7 +449,7 @@ class DualReplay(BaseContinualMethod):
                     domain_loss = F.cross_entropy(
                         domain_logits[valid_domain], domain_tensor[valid_domain]
                     )
-                    loss = loss + 0.1 * domain_loss
+                    loss = loss + 1.0 * domain_loss
 
                 if loss.requires_grad:
                     scaled_loss = loss / self.gradient_accumulation_steps
@@ -422,7 +474,12 @@ class DualReplay(BaseContinualMethod):
         avg_loss = total_loss / max(1, total_steps)
         return {"loss": avg_loss}
 
-    def run_evaluation(self, test_data: list[dict], valid_labels=None) -> dict[str, float]:
+    def run_evaluation(
+        self,
+        test_data: list[dict],
+        valid_labels=None,
+        oracle_domain_id: int | None = None,
+    ) -> dict[str, float]:
         if self.model is None:
             raise RuntimeError("Must call train_domain() before evaluation.")
         self.model.eval()
@@ -443,7 +500,7 @@ class DualReplay(BaseContinualMethod):
                 task_logits, _domain_logits = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    domain_id=None,
+                    domain_id=oracle_domain_id,
                 )
 
                 preds = masked_argmax(task_logits, valid_labels).cpu()

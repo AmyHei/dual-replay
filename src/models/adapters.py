@@ -18,12 +18,20 @@ class BottleneckAdapter(nn.Module):
         nn.init.zeros_(self.up.bias)
         # Gate vector set externally before forward pass (by DualReplayModel)
         self._gate: torch.Tensor | None = None
+        # Bypass flag: when True, forward returns input unchanged (used to get
+        # frozen-encoder output for domain classification, matching paper 4.2).
+        self._bypass: bool = False
 
     def set_gate(self, gate: torch.Tensor | None):
         """Set a (bottleneck_dim,) gate vector for task-conditioned modulation."""
         self._gate = gate
 
+    def set_bypass(self, bypass: bool):
+        self._bypass = bypass
+
     def forward(self, h: torch.Tensor) -> torch.Tensor:
+        if self._bypass:
+            return h
         mid = self.activation(self.down(h))  # (..., bottleneck_dim)
         if self._gate is not None:
             mid = mid * self._gate  # element-wise gating
