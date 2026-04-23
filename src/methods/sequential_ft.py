@@ -24,6 +24,7 @@ class SequentialFT(BaseContinualMethod):
         self.max_seq_len: int = kwargs.get("max_seq_len", 128)
         self.gradient_accumulation_steps: int = kwargs.get("gradient_accumulation_steps", 1)
         self.warmup_ratio: float = kwargs.get("warmup_ratio", 0.1)
+        self.unfreeze_top_k: int = kwargs.get("unfreeze_top_k", 0)  # 0 = full FT
 
         self.tokenizer = None
         self.model: nn.Module | None = None
@@ -134,6 +135,19 @@ class SequentialFT(BaseContinualMethod):
             self._num_labels = num_labels
             self.model = _load_model_for_classification(self.model_name, num_labels)
             self.model.to(self.device)
+            if self.unfreeze_top_k > 0:
+                # Freeze all, then unfreeze top-k encoder layers + classifier
+                for param in self.model.parameters():
+                    param.requires_grad = False
+                # Unfreeze classifier
+                for param in self.model.classifier.parameters():
+                    param.requires_grad = True
+                # Unfreeze top-k encoder layers
+                if hasattr(self.model, 'bert'):
+                    layers = self.model.bert.encoder.layer
+                    for layer in layers[-self.unfreeze_top_k:]:
+                        for param in layer.parameters():
+                            param.requires_grad = True
         elif num_labels > self._num_labels:
             resize_classifier(self.model, self._num_labels, num_labels, self.device)
             self._num_labels = num_labels

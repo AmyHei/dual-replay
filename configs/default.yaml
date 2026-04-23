@@ -64,29 +64,35 @@ clinc150:
     sequential_ft:                     # best: F1=60.8, BWT=-40.4
       learning_rate: 5.0e-5
       warmup_ratio: 0.15
-    ewc:                               # proxy: F1=51.2, lr=1e-4, warmup=0.1
-      learning_rate: 3.0e-5            # standard BERT-large FT range
-      warmup_ratio: 0.1
-    replay_only:                       # proxy: F1=83.8, lr=5e-4, epochs=5
-      learning_rate: 6.0e-5
-      replay_ratio: 0.50              # more replay for class-incremental retention
+    ewc:                               # proxy Apr-16: F1=75.2 (lr=3e-4, warmup=0.2, lambda=100, fisher=500)
+      learning_rate: 3.75e-5           # 3e-4 ÷ 8 (bert-tiny→bert-large)
+      warmup_ratio: 0.2
+      ewc_lambda: 100.0
+      ewc_fisher_samples: 500
+    replay_only:                       # proxy Apr-16: F1=96.3 (lr=8e-4, warmup=0.15, rr=0.3, buf=200, ep=5)
+      learning_rate: 1.0e-4            # 8e-4 ÷ 8 (bert-tiny→bert-large)
+      warmup_ratio: 0.15
+      replay_ratio: 0.30
     lora_only:                         # proxy: F1=36.7, lr=5e-4, adapter_r=4→scale to 64
       learning_rate: 6.0e-5
-    lora_replay:                       # proxy: F1=63.2, lr=2e-3, epochs=5, replay=0.3
-      learning_rate: 2.5e-4
-      replay_ratio: 0.30
+    lora_replay:                       # proxy Apr-16: F1=93.0 (lr=2e-3, warmup=0.05, rr=0.3, adapter_r=4)
+      learning_rate: 2.5e-4             # 2e-3 ÷ 8 (bert-tiny→bert-large)
       warmup_ratio: 0.05
+      replay_ratio: 0.30
+      adapter_r: 32                     # scaled from proxy 4 (same rule as dual_replay)
     o_lora:                            # proxy: F1=39.7, lr=1e-3, epochs=5
       learning_rate: 1.2e-4
-    der:                               # proxy: F1=71.6, lr=2e-3, replay=0.3, warmup=0.15
-      learning_rate: 2.5e-4
+    der:                               # proxy Apr-16: F1=71.6 (lr=2e-3, warmup=0.15, rr=0.3, adapter_r=4)
+      learning_rate: 2.5e-4             # 2e-3 ÷ 8 (bert-tiny→bert-large)
+      warmup_ratio: 0.15
       replay_ratio: 0.30
-      warmup_ratio: 0.15
-    dual_replay:                       # proxy: F1=77.0, lr=5e-4, adapter_r=16, unfreeze=2/2
-      learning_rate: 6.25e-5           # 5e-4 ÷ 8 (dim_tiny/dim_large)
-      replay_ratio: 0.40               # original ratio, larger buffer provides variety
-      warmup_ratio: 0.15
-      unfreeze_top_k: 4                # 2/2 layers on tiny ≈ 4/24 on large (~17%)
+      adapter_r: 32                     # scaled from proxy 4 (same rule as dual_replay)
+    dual_replay:                       # paper-canonical (Sec 4.1 + Table 3): 100% frozen, α=0.20, r_a=64
+      learning_rate: 1.25e-4           # adapter-only LR on bert-large
+      warmup_ratio: 0.15               # clinc150 default (autoresearch-tuned-for-taskinc value reverted)
+      replay_ratio: 0.20               # paper Section 4.3 (α=0.20)
+      adapter_r: 64                    # paper main config (proxy-tuned r=32 reverted)
+      unfreeze_top_k: 0                # 100% base frozen — paper Table 3 shows it beats any unfreezing
 
 # T5 config (Phase 3)
 t5:
