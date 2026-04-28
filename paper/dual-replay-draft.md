@@ -241,7 +241,11 @@ All replay methods receive the same per-domain buffer cap (500 examples, 200 for
 
 ### 5.2 Main Results
 
-Table 1 reports the final-step Avg F1 and BWT for all seven methods on each of the three benchmarks (n=5 seeds per cell, 105 runs total).
+Table 1 reports the final-step Avg F1 and BWT for all seven methods on each of the three benchmarks (n=5 seeds per cell, 105 runs total). Figure 1 visualizes the same data.
+
+![Phase 4 main results across three benchmarks. Replay-Only (full FT + replay) dominates every PEFT method by 15–30 F1; Dual-Replay narrowly wins on the two balanced benchmarks but collapses on the imbalanced HWU64.](figures/fig1_main_comparison.pdf)
+*Figure 1: Class-incremental Avg F1 by method and benchmark (mean ± std over 5 seeds, BERT-base).*
+
 
 **Table 1: Class-incremental results across three benchmarks (BERT-base, mean ± std over 5 seeds).**
 
@@ -268,7 +272,11 @@ LoRA-Only (no replay) collapses uniformly to ~2 F1 across benchmarks — confirm
 
 ### 5.3 Per-domain breakdown on HWU64
 
-To understand *where* Dual-Replay loses on HWU64, we decompose the final-step F1 by domain. HWU64 has heavy size variance: train per scenario ranges from 157 (`cooking`, 1 intent) to 1510 (`general`, 10 intents). We split the 18 scenarios into "tail" (train < 300, $n=4$) and "head" (train ≥ 300, $n=14$).
+To understand *where* Dual-Replay loses on HWU64, we decompose the final-step F1 by domain (Figure 2). HWU64 has heavy size variance: train per scenario ranges from 157 (`cooking`, 1 intent) to 1510 (`general`, 10 intents). We split the 18 scenarios into "tail" (train < 300, $n=4$) and "head" (train ≥ 300, $n=14$).
+
+![HWU64 per-domain final-step F1, sorted left-to-right by training-set size. The 'tail' (smallest 4 scenarios) shows Dual-Replay roughly comparable to LoRA+Replay; the 'head' (right of the dashed line) shows Dual-Replay falling consistently below.](figures/fig2_hwu64_per_domain.pdf)
+*Figure 2: Per-domain final F1 on HWU64 (5 seeds, sorted by training-set size). Cooking is a 1-intent scenario where any method scores ~80% by trivially predicting the single class.*
+
 
 **Table 2: HWU64 per-group F1 after all 18 scenarios trained (mean over 5 seeds).**
 
@@ -289,7 +297,11 @@ Counter to a natural prior, **Dual-Replay's loss is concentrated on the head, no
 | recommendation | 3 | 404 | 13.2 | 29.6 | 37.1 | −16.3 |
 | play | 5 | 783 | 1.3 | 15.5 | 12.5 | −14.3 |
 
-The pattern is mid-size, multi-intent scenarios dropping to near-zero F1 by the end of the sequence. This is consistent with adapter-gating + trainable domain-classifier driving representational drift on the head as later domains overwrite the shared adapter weights — without the gating signal being strong enough to recover the earlier-domain encoding at test time.
+The pattern is mid-size, multi-intent scenarios dropping to near-zero F1 by the end of the sequence. This is consistent with adapter-gating + trainable domain-classifier driving representational drift on the head as later domains overwrite the shared adapter weights — without the gating signal being strong enough to recover the earlier-domain encoding at test time. Figure 3 visualizes this for a single representative head domain (`music`) over training steps.
+
+![Forgetting trajectory of HWU64's `music` scenario for seed=42. All three methods score ~50 F1 immediately after training music; the next domain training step collapses Dual-Replay to near zero, while LoRA+Replay and DER recover and oscillate around 15–30 F1.](figures/fig3_hwu64_forgetting.pdf)
+*Figure 3: F1 on `music` test set after each subsequent training step (seed=42).*
+
 
 ### 5.4 Ablation: dual buffer without gating (LoRA-Replay-Dual)
 
