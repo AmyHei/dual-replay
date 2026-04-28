@@ -49,7 +49,10 @@ class SequentialFT(BaseContinualMethod):
 
         combined = train_data + (replay_data or [])
         max_label = max(item["label"] for item in combined)
-        self._ensure_model(num_labels=max_label + 1)
+        # BertForSequenceClassification interprets num_labels=1 as regression
+        # and switches to MSELoss (which fails on integer labels via MPS).
+        # Force at least 2 to keep classification semantics for tiny domains.
+        self._ensure_model(num_labels=max(2, max_label + 1))
 
         dataset = TextDataset(combined, self.tokenizer, self.max_seq_len)
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)

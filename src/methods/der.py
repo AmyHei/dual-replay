@@ -127,7 +127,7 @@ class DER(BaseContinualMethod):
         self.current_domain = domain_id
         combined_new = train_data + (replay_data or [])
         max_label = max(item["label"] for item in combined_new)
-        self._ensure_model(num_labels=max_label + 1)
+        self._ensure_model(num_labels=max(2, max_label + 1))
 
         rng = random.Random(42 + domain_id)
         replay_n = max(1, int(len(train_data) * self.replay_ratio))

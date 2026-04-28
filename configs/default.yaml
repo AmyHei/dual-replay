@@ -38,11 +38,180 @@ autoresearch:
   ewc_fisher_samples: 100
   ewc_lambda: 5000.0
 
+# --- Per-benchmark bert-tiny proxies (class-incremental eval) ---
+# Each proxy runs the FULL benchmark on bert-tiny to match the real class-inc
+# protocol (not truncated). Autoresearch explores lr/warmup/replay/etc. here,
+# then winning configs are scaled for bert-large experiments.
+
+proxy_clinc150_10:
+  benchmark: "clinc150_10"
+  model_name: "prajjwal1/bert-tiny"
+  num_domains: 10
+  epochs_per_domain: 2
+  batch_size: 16
+  adapter_r: 16
+  max_seq_len: 64
+  domain_buffer_size: 100
+  general_buffer_size: 500
+  learning_rate: 5.0e-4
+  warmup_ratio: 0.1
+  replay_ratio: 0.20
+  domain_replay_fraction: 0.10
+  num_orderings: 1
+  ewc_fisher_samples: 100
+  ewc_lambda: 5000.0
+
+proxy_hwu64:
+  benchmark: "hwu64"
+  model_name: "prajjwal1/bert-tiny"
+  num_domains: 18
+  epochs_per_domain: 2
+  batch_size: 16
+  adapter_r: 16
+  max_seq_len: 64
+  domain_buffer_size: 100
+  general_buffer_size: 500
+  learning_rate: 5.0e-4
+  warmup_ratio: 0.1
+  replay_ratio: 0.20
+  domain_replay_fraction: 0.10
+  num_orderings: 1
+  ewc_fisher_samples: 100
+  ewc_lambda: 5000.0
+
+proxy_banking77:
+  benchmark: "banking77"
+  model_name: "prajjwal1/bert-tiny"
+  num_domains: 7
+  epochs_per_domain: 2
+  batch_size: 16
+  adapter_r: 16
+  max_seq_len: 64
+  domain_buffer_size: 100
+  general_buffer_size: 500
+  learning_rate: 5.0e-4
+  warmup_ratio: 0.1
+  replay_ratio: 0.20
+  domain_replay_fraction: 0.10
+  num_orderings: 1
+  ewc_fisher_samples: 100
+  ewc_lambda: 5000.0
+
 # Full CLINC150 config (GPU or Mac Apple Silicon)
 # Shared base — full-FT methods (sequential_ft, ewc, replay_only) use these directly.
 # Adapter methods override learning_rate below (frozen base tolerates higher LR).
+# --- bert-large main experiments (class-incremental) ---
+
+# Shared template for the three benchmarks. Per-method hyperparams are
+# lit-informed defaults derived from prior (task-inc) autoresearch; they may
+# be refined by a targeted autoresearch pass on dual_replay (Phase 3 downgrade)
+# if main-experiment results expose a configuration gap.
+
+clinc150_10:
+  benchmark: "clinc150_10"
+  model_name: "bert-base-uncased"
+  num_domains: 10
+  epochs_per_domain: 5
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  adapter_r: 64
+  max_seq_len: 128
+  domain_buffer_size: 500
+  general_buffer_size: 1000
+  learning_rate: 1.5e-5
+  warmup_ratio: 0.15
+  replay_ratio: 0.20
+  domain_replay_fraction: 0.10
+  num_orderings: 5
+  ewc_fisher_samples: 500
+  ewc_lambda: 5000.0
+  method_overrides:
+    sequential_ft: {learning_rate: 5.0e-5, warmup_ratio: 0.15}
+    ewc: {learning_rate: 3.75e-5, warmup_ratio: 0.2, ewc_lambda: 100.0, ewc_fisher_samples: 500}
+    replay_only: {learning_rate: 1.0e-4, warmup_ratio: 0.15, replay_ratio: 0.30}
+    lora_only: {learning_rate: 6.0e-5}
+    lora_replay: {learning_rate: 2.5e-4, warmup_ratio: 0.05, replay_ratio: 0.30, adapter_r: 32}
+    lora_replay_dual: {learning_rate: 2.5e-4, warmup_ratio: 0.05, replay_ratio: 0.30, adapter_r: 32, domain_replay_fraction: 0.15}
+    o_lora: {learning_rate: 1.2e-4}
+    der: {learning_rate: 2.5e-4, warmup_ratio: 0.15, replay_ratio: 0.30, adapter_r: 32}
+    dual_replay:
+      learning_rate: 1.25e-4
+      warmup_ratio: 0.15
+      replay_ratio: 0.20
+      adapter_r: 64
+      unfreeze_top_k: 0
+
+hwu64:
+  benchmark: "hwu64"
+  model_name: "bert-base-uncased"
+  num_domains: 18
+  epochs_per_domain: 5
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  adapter_r: 64
+  max_seq_len: 128
+  domain_buffer_size: 200
+  general_buffer_size: 500
+  learning_rate: 1.5e-5
+  warmup_ratio: 0.15
+  replay_ratio: 0.20
+  domain_replay_fraction: 0.10
+  num_orderings: 5
+  ewc_fisher_samples: 500
+  ewc_lambda: 5000.0
+  method_overrides:
+    sequential_ft: {learning_rate: 5.0e-5, warmup_ratio: 0.15}
+    ewc: {learning_rate: 3.75e-5, warmup_ratio: 0.2, ewc_lambda: 100.0, ewc_fisher_samples: 500}
+    replay_only: {learning_rate: 1.0e-4, warmup_ratio: 0.15, replay_ratio: 0.30}
+    lora_only: {learning_rate: 6.0e-5}
+    lora_replay: {learning_rate: 2.5e-4, warmup_ratio: 0.05, replay_ratio: 0.30, adapter_r: 32}
+    lora_replay_dual: {learning_rate: 2.5e-4, warmup_ratio: 0.05, replay_ratio: 0.30, adapter_r: 32, domain_replay_fraction: 0.15}
+    o_lora: {learning_rate: 1.2e-4}
+    der: {learning_rate: 2.5e-4, warmup_ratio: 0.15, replay_ratio: 0.30, adapter_r: 32}
+    dual_replay:
+      learning_rate: 1.25e-4
+      warmup_ratio: 0.15
+      replay_ratio: 0.20
+      adapter_r: 64
+      unfreeze_top_k: 0
+
+banking77:
+  benchmark: "banking77"
+  model_name: "bert-base-uncased"
+  num_domains: 7
+  epochs_per_domain: 5
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  adapter_r: 64
+  max_seq_len: 128
+  domain_buffer_size: 500
+  general_buffer_size: 0          # Banking77 has no OOS; general buffer is empty
+  learning_rate: 1.5e-5
+  warmup_ratio: 0.15
+  replay_ratio: 0.20
+  domain_replay_fraction: 0.20    # no general stream → put full replay on domain stream
+  num_orderings: 5
+  ewc_fisher_samples: 500
+  ewc_lambda: 5000.0
+  method_overrides:
+    sequential_ft: {learning_rate: 5.0e-5, warmup_ratio: 0.15}
+    ewc: {learning_rate: 3.75e-5, warmup_ratio: 0.2, ewc_lambda: 100.0, ewc_fisher_samples: 500}
+    replay_only: {learning_rate: 1.0e-4, warmup_ratio: 0.15, replay_ratio: 0.30}
+    lora_only: {learning_rate: 6.0e-5}
+    lora_replay: {learning_rate: 2.5e-4, warmup_ratio: 0.05, replay_ratio: 0.30, adapter_r: 32}
+    lora_replay_dual: {learning_rate: 2.5e-4, warmup_ratio: 0.05, replay_ratio: 0.30, adapter_r: 32, domain_replay_fraction: 0.15}
+    o_lora: {learning_rate: 1.2e-4}
+    der: {learning_rate: 2.5e-4, warmup_ratio: 0.15, replay_ratio: 0.30, adapter_r: 32}
+    dual_replay:
+      learning_rate: 1.25e-4
+      warmup_ratio: 0.15
+      replay_ratio: 0.20
+      adapter_r: 64
+      unfreeze_top_k: 0
+
+# Legacy: 15-sub-domain CLINC150 (kept for archived experiments)
 clinc150:
-  model_name: "bert-large-uncased"
+  model_name: "bert-base-uncased"
   num_domains: 15
   epochs_per_domain: 5
   batch_size: 8

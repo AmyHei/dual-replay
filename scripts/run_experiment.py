@@ -15,7 +15,7 @@ _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from src.data.clinc150 import build_15_domain_protocol, get_general_buffer
+from src.data import build_benchmark
 from src.data.domain_sequence import generate_domain_orderings
 from src.training.runner import SequentialRunner
 
@@ -29,6 +29,7 @@ METHOD_MAP = {
     "o_lora": ("src.methods.o_lora", "OLoRA"),
     "der": ("src.methods.der", "DER"),
     "dual_replay": ("src.methods.dual_replay", "DualReplay"),
+    "lora_replay_dual": ("src.methods.lora_replay_dual", "LoRAReplayDual"),
 }
 
 
@@ -43,9 +44,11 @@ def load_config(config_name: str) -> dict:
     if config_name not in all_configs:
         raise ValueError(f"Config '{config_name}' not found. Available: {list(all_configs.keys())}")
     config = dict(all_configs[config_name])
-    # Apply autoresearch overrides if present
-    override_path = os.path.join(config_dir, "autoresearch_override.yaml")
-    if config_name == "autoresearch" and os.path.exists(override_path):
+    # Apply autoresearch overrides if present (named per config)
+    override_path = os.path.join(
+        config_dir, f"autoresearch_override_{config_name}.yaml"
+    )
+    if os.path.exists(override_path):
         with open(override_path) as f:
             overrides = yaml.safe_load(f) or {}
         config.update(overrides)
@@ -66,7 +69,10 @@ def get_method(method_name: str, config: dict):
 
     # Map config keys to constructor kwargs.
     # Some configs use "epochs_per_domain" but methods expect "epochs".
-    kwargs = {k: v for k, v in config.items() if k not in ("model_name", "num_domains")}
+    kwargs = {
+        k: v for k, v in config.items()
+        if k not in ("model_name", "num_domains", "benchmark", "num_orderings", "seed", "seeds")
+    }
     if "epochs_per_domain" in kwargs and "epochs" not in kwargs:
         kwargs["epochs"] = kwargs.pop("epochs_per_domain")
     else:
@@ -85,29 +91,32 @@ def main():
     parser.add_argument("--config", default="debug", help="Config name from configs/default.yaml")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", default="results")
+    parser.add_argument(
+        "--benchmark",
+        default=None,
+        choices=["clinc150_10", "clinc150_15", "hwu64", "banking77"],
+        help="Benchmark name; if omitted, read from config.benchmark (default clinc150_10).",
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
-    print(f"Loading CLINC150 (seed={args.seed})...")
-    domains = build_15_domain_protocol(seed=args.seed)
+    benchmark = args.benchmark or config.get("benchmark", "clinc150_10")
 
-    orderings = generate_domain_orderings(len(domains), num_orderings=1, seed=args.seed)
-    ordered_domains = [domains[i] for i in orderings[0]]
+    print(f"Loading {benchmark} (seed={args.seed})...")
+    domains, general_buffer = build_benchmark(benchmark, seed=args.seed)
 
-    num_domains = config.get("num_domains", len(ordered_domains))
+    # benchmark loaders already shuffle by seed; skip additional ordering
+    ordered_domains = domains
+
+    num_domains = config.get("num_domains") or len(ordered_domains)
     ordered_domains = ordered_domains[:num_domains]
 
-    print(f"Method: {args.method}  |  Config: {args.config}  |  Domains: {num_domains}")
+    print(f"Method: {args.method}  |  Config: {args.config}  |  Benchmark: {benchmark}  |  Domains: {num_domains}")
     method = get_method(args.method, config)
 
-    # For methods that need a general replay buffer (dual_replay)
+    # Methods with a general replay buffer (dual_replay) get one from the benchmark
     if hasattr(method, "fill_general_buffer"):
-        print("Filling general replay buffer...")
-        general_buffer = get_general_buffer(
-            max_size=config.get("general_buffer_size", 1000), seed=args.seed
-        )
-        # The general buffer uses "intent": "oos" strings; remap to label=-1 so
-        # the runner treats them as unlabelled / general-domain examples.
+        print(f"Filling general replay buffer (size={len(general_buffer)})...")
         general_buffer_clean = [
             {"text": ex["text"], "label": -1} for ex in general_buffer
         ]

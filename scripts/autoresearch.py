@@ -79,33 +79,34 @@ METHOD_SPACE = {
 }
 
 
-OVERRIDE_FILE = "configs/autoresearch_override.yaml"
+def _override_path(config_name: str) -> str:
+    return f"configs/autoresearch_override_{config_name}.yaml"
 
 
 def load_config(config_name="autoresearch"):
     with open("configs/default.yaml") as f:
         all_configs = yaml.safe_load(f)
     base = dict(all_configs[config_name])
-    # Apply overrides if they exist
-    if os.path.exists(OVERRIDE_FILE):
-        with open(OVERRIDE_FILE) as f:
+    override_path = _override_path(config_name)
+    if os.path.exists(override_path):
+        with open(override_path) as f:
             overrides = yaml.safe_load(f) or {}
         base.update(overrides)
     return base
 
 
 def save_config(config, config_name="autoresearch"):
-    """Write overrides to a separate file, never touch default.yaml."""
-    # Load the base to compute diff
+    """Write overrides to a per-config file, never touch default.yaml."""
     with open("configs/default.yaml") as f:
         all_configs = yaml.safe_load(f)
     base = dict(all_configs[config_name])
     overrides = {k: v for k, v in config.items() if config[k] != base.get(k)}
+    override_path = _override_path(config_name)
     if overrides:
-        with open(OVERRIDE_FILE, "w") as f:
+        with open(override_path, "w") as f:
             yaml.dump(overrides, f, default_flow_style=False)
-    elif os.path.exists(OVERRIDE_FILE):
-        os.remove(OVERRIDE_FILE)
+    elif os.path.exists(override_path):
+        os.remove(override_path)
 
 
 def run_experiment(method, config_name="autoresearch", seed=42, timeout=300):

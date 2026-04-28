@@ -66,15 +66,10 @@ def build_scenario_protocol(seed: int = 42) -> list[dict]:
 
 
 def get_general_buffer(max_size: int = 1000, seed: int = 42) -> list[dict]:
-    """HWU64 lacks an OOS split; sample from the `general` scenario as a proxy
-    for the general-knowledge replay stream."""
-    ds = load_hwu64_raw()
-    general_samples = [
-        {"text": ex["text"], "intent": "general"}
-        for ex in ds["train"]
-        if _intent_to_scenario(ex["label_text"]) == "general"
-    ]
-    rng = random.Random(seed)
-    if len(general_samples) > max_size:
-        general_samples = rng.sample(general_samples, max_size)
-    return general_samples
+    """HWU64 has no OOS split, and the `general` scenario is itself one of
+    the 18 sequential training domains — using it as the general buffer
+    creates a label conflict (same examples appear with both intent labels
+    and label=-1 at different points in training). Return empty so DualReplay
+    on HWU64 runs with domain-stream replay only.
+    """
+    return []
